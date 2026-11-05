@@ -1,0 +1,282 @@
+import json
+from datetime import datetime
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QBrush
+from PySide6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QSplitter,
+    QHeaderView,
+    QAbstractItemView,
+)
+
+
+class LiveMonitor(QWidget):
+    """
+    Monitor visual dos eventos do VINI_JR Agent Studio.
+
+    Recebe atualizações pelo EventManager e apresenta
+    histórico, status, origem e detalhes das operações.
+    """
+
+    STATUS_COLORS = {
+        "info": "#60A5FA",
+        "running": "#FBBF24",
+        "success": "#22C55E",
+        "warning": "#F59E0B",
+        "error": "#EF4444",
+        "waiting": "#A78BFA",
+        "cancelled": "#9CA3AF",
+    }
+
+    def __init__(self, event_manager, parent=None):
+        super().__init__(parent)
+
+        if event_manager is None:
+            raise ValueError("EventManager é obrigatório.")
+
+        self.event_manager = event_manager
+
+        self.setObjectName("LiveMonitor")
+
+        self._build_ui()
+
+        self.event_manager.history_changed.connect(
+            self.refresh
+        )
+
+        self.refresh()
+
+    def _build_ui(self):
+
+        main_layout = QVBoxLayout(self)
+
+        header = QHBoxLayout()
+
+        title = QLabel("MONITORAMENTO EM TEMPO REAL")
+        title.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #E8EDF5;"
+        )
+
+        self.event_count_label = QLabel("0 eventos")
+        self.event_count_label.setObjectName("eventCountLabel")
+
+        self.event_count_label.setStyleSheet(
+            "color: #60A5FA; font-weight: bold;"
+        )
+
+        self.clear_button = QPushButton("Limpar histórico")
+        self.clear_button.setObjectName("clearHistoryButton")
+
+        self.clear_button.clicked.connect(
+            self.event_manager.clear_history
+        )
+
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.event_count_label)
+        header.addWidget(self.clear_button)
+
+        main_layout.addLayout(header)
+
+        self.table = QTableWidget()
+        self.table.setObjectName("eventTable")
+
+        self.table.setColumnCount(5)
+
+        self.table.setHorizontalHeaderLabels([
+            "Horário",
+            "Categoria",
+            "Origem",
+            "Status",
+            "Atividade",
+        ])
+
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+
+        self.table.verticalHeader().setVisible(False)
+
+        header_view = self.table.horizontalHeader()
+
+        for column in range(4):
+            header_view.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents
+            )
+
+        header_view.setSectionResizeMode(
+            4,
+            QHeaderView.ResizeMode.Stretch
+        )
+
+        self.table.itemSelectionChanged.connect(
+            self._show_selected_event
+        )
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        splitter.addWidget(self.table)
+
+        details_container = QWidget()
+        details_layout = QVBoxLayout(details_container)
+
+        details_title = QLabel("DETALHES DO EVENTO")
+
+        details_title.setStyleSheet(
+            "font-weight: bold; color: #93C5FD;"
+        )
+
+        self.details = QTextEdit()
+        self.details.setObjectName("eventDetails")
+        self.details.setReadOnly(True)
+
+        self.details.setPlaceholderText(
+            "Selecione uma atividade para visualizar seus detalhes."
+        )
+
+        details_layout.addWidget(details_title)
+        details_layout.addWidget(self.details)
+
+        splitter.addWidget(details_container)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+
+        main_layout.addWidget(splitter, 1)
+
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: #263449;
+                color: #E8EDF5;
+                gridline-color: #40516B;
+                selection-background-color: #1D4ED8;
+                border: 1px solid #40516B;
+            }
+
+            QHeaderView::section {
+                background-color: #18212F;
+                color: #E8EDF5;
+                padding: 8px;
+                border: 1px solid #40516B;
+                font-weight: bold;
+            }
+
+            QTableWidget::item {
+                padding: 5px;
+            }
+        """)
+
+    def refresh(self):
+
+        events = self.event_manager.history()
+
+        self.table.setRowCount(0)
+
+        self._events = list(events)
+
+        for event in self._events:
+            self._append_event(event)
+
+        total = len(self._events)
+
+        label = "evento" if total == 1 else "eventos"
+
+        self.event_count_label.setText(
+            f"{total} {label}"
+        )
+
+        if not self._events:
+            self.details.clear()
+
+    def _append_event(self, event):
+
+        row = self.table.rowCount()
+
+        self.table.insertRow(row)
+
+        try:
+            timestamp = datetime.fromisoformat(
+                event.timestamp.replace("Z", "+00:00")
+            )
+
+            time_text = timestamp.astimezone().strftime(
+                "%d/%m/%Y %H:%M:%S"
+            )
+
+        except (ValueError, TypeError):
+            time_text = str(event.timestamp)
+
+        values = [
+            time_text,
+            str(event.category),
+            str(event.source),
+            str(event.status).upper(),
+            str(event.message),
+        ]
+
+        for column, value in enumerate(values):
+
+            item = QTableWidgetItem(value)
+
+            if column == 3:
+
+                color = self.STATUS_COLORS.get(
+                    event.status,
+                    "#E8EDF5"
+                )
+
+                item.setForeground(QBrush(QColor(color)))
+
+            self.table.setItem(row, column, item)
+
+    def _show_selected_event(self):
+
+        selected = self.table.selectionModel().selectedRows()
+
+        if not selected:
+            return
+
+        row = selected[0].row()
+
+        if row < 0 or row >= len(self._events):
+            return
+
+        event = self._events[row]
+
+        details = {
+            "event_id": event.event_id,
+            "timestamp": event.timestamp,
+            "category": event.category,
+            "event_type": event.event_type,
+            "message": event.message,
+            "status": event.status,
+            "source": event.source,
+            "task_id": event.task_id,
+            "details": event.details,
+        }
+
+        self.details.setPlainText(
+            json.dumps(
+                details,
+                indent=4,
+                ensure_ascii=False,
+                default=str
+            )
+        )

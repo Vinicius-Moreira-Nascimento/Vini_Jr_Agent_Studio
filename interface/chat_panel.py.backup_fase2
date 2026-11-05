@@ -1,0 +1,293 @@
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QTextEdit,
+    QLineEdit, QPushButton, QHBoxLayout,
+    QMessageBox
+)
+from PySide6.QtCore import QThread, Signal
+
+from providers.openai_provider import OpenAIProvider
+from project_engine.project_context import (
+    build_project_context,
+    format_project_context
+)
+
+import json
+import os
+
+
+class AIWorker(QThread):
+
+    finished_response = Signal(str)
+    error_response = Signal(str)
+
+    def __init__(self, api_key, model, messages):
+        super().__init__()
+        self.api_key = api_key
+        self.model = model
+        self.messages = messages
+
+    def run(self):
+        try:
+            provider = OpenAIProvider(self.api_key)
+            result = provider.send_message(
+                self.messages,
+                self.model
+            )
+            self.finished_response.emit(result)
+
+        except Exception as error:
+            self.error_response.emit(str(error))
+
+
+class ChatPanel(QWidget):
+
+    def __init__(self):
+        super().__init__()
+
+        self.messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Voce e VINI_JR, um agente de "
+                    "programacao. Responda em portugues, "
+                    "com clareza e foco tecnico. "
+                    "Quando receber contexto de projeto, "
+                    "baseie suas respostas nos arquivos "
+                    "fornecidos. Diferencie fatos do codigo "
+                    "de inferencias. Nunca invente trechos "
+                    "ou comportamentos que nao estejam "
+                    "demonstrados no contexto."
+                )
+            }
+        ]
+
+        self.project_path_provider = None
+        self.project_context_text = ""
+
+        layout = QVBoxLayout(self)
+
+        self.chat = QTextEdit()
+        self.chat.setReadOnly(True)
+        self.chat.setPlaceholderText("Conversacao com VINI_JR")
+        layout.addWidget(self.chat)
+
+        project_controls = QHBoxLayout()
+
+        self.analyze_button = QPushButton("Analisar projeto")
+        self.analyze_button.clicked.connect(
+            self.load_project_context
+        )
+
+        self.clear_context_button = QPushButton(
+            "Remover contexto"
+        )
+        self.clear_context_button.clicked.connect(
+            self.clear_project_context
+        )
+
+        project_controls.addWidget(self.analyze_button)
+        project_controls.addWidget(self.clear_context_button)
+        project_controls.addStretch()
+
+        layout.addLayout(project_controls)
+
+        bottom = QHBoxLayout()
+
+        self.input = QLineEdit()
+        self.input.setPlaceholderText(
+            "Digite sua solicitacao..."
+        )
+        self.input.returnPressed.connect(self.send_message)
+
+        self.send = QPushButton("Enviar")
+        self.send.clicked.connect(self.send_message)
+
+        bottom.addWidget(self.input)
+        bottom.addWidget(self.send)
+
+        layout.addLayout(bottom)
+
+        self.worker = None
+
+    def set_project_path_provider(self, provider):
+        self.project_path_provider = provider
+
+    def load_project_context(self):
+
+        if not self.project_path_provider:
+            QMessageBox.warning(
+                self,
+                "Projeto",
+                "O caminho do projeto ainda nao foi configurado."
+            )
+            return
+
+        project = self.project_path_provider()
+
+        if not project:
+            QMessageBox.warning(
+                self,
+                "Projeto",
+                "Selecione primeiro um projeto na aba "
+                "Embedded Development."
+            )
+            return
+
+        self.analyze_button.setEnabled(False)
+
+        try:
+            context = build_project_context(project)
+            context_text = format_project_context(context)
+
+            analysis = context["analysis"]
+
+            report = (
+                f"Projeto: {project}\n"
+                f"Arquivos encontrados: "
+                f"{context['total_files_found']}\n"
+                f"Arquivos lidos: {context['files_read']}\n"
+                f"Funcoes identificadas: "
+                f"{len(analysis['functions'])}\n"
+                f"APIs de tarefas: "
+                f"{analysis['task_apis']}\n"
+                f"Perifericos: "
+                f"{list(analysis['peripherals'].keys())}\n"
+                f"Contexto: {len(context_text)} caracteres."
+            )
+
+            self.chat.append(
+                "\n<b>VINI_JR - Analise local do projeto:</b>"
+            )
+            self.chat.append(report)
+
+            answer = QMessageBox.question(
+                self,
+                "Compartilhar contexto com a OpenAI?",
+                "A leitura local foi concluida.\n\n"
+                + report
+                + "\n\nAo aceitar, os arquivos lidos e a "
+                "analise serao incluidos nas solicitacoes "
+                "enviadas a API OpenAI.\n\n"
+                "Verifique se o codigo nao contem senhas, "
+                "tokens ou informacoes confidenciais.\n\n"
+                "Deseja carregar esse contexto no chat?",
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No
+            )
+
+            if answer == QMessageBox.StandardButton.Yes:
+                self.project_context_text = context_text
+
+                self.chat.append(
+                    "<b>VINI_JR:</b> Contexto do projeto "
+                    "carregado. Pode fazer perguntas sobre "
+                    "o firmware."
+                )
+            else:
+                self.project_context_text = ""
+
+                self.chat.append(
+                    "<b>VINI_JR:</b> Contexto nao enviado "
+                    "ao chat. A analise local foi concluida."
+                )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Erro na analise",
+                str(error)
+            )
+
+        finally:
+            self.analyze_button.setEnabled(True)
+
+    def clear_project_context(self):
+        self.project_context_text = ""
+
+        self.chat.append(
+            "<b>VINI_JR:</b> Contexto do projeto removido."
+        )
+
+    def send_message(self):
+
+        text = self.input.text().strip()
+
+        if not text:
+            return
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        api_path = os.path.join("config", "providers.json")
+        settings_path = os.path.join("config", "settings.json")
+
+        with open(api_path, "r", encoding="utf-8-sig") as file:
+            config = json.load(file)
+
+        with open(settings_path, "r", encoding="utf-8-sig") as file:
+            settings = json.load(file)
+
+        api_key = config["openai"].get("api_key", "")
+        model = settings.get("model", "gpt-4.1-mini")
+
+        if not api_key:
+            self.chat.append(
+                "<b>VINI_JR:</b> Configure sua API Key primeiro."
+            )
+            return
+
+        self.chat.append(f"<b>Voce:</b> {text}")
+        self.input.clear()
+        self.send.setEnabled(False)
+
+        self.messages.append({
+            "role": "user",
+            "content": text
+        })
+
+        request_messages = self.messages.copy()
+
+        if self.project_context_text:
+            request_messages.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": self.project_context_text
+                }
+            )
+
+        self.chat.append(
+            "<i>VINI_JR esta processando...</i>"
+        )
+
+        self.worker = AIWorker(
+            api_key,
+            model,
+            request_messages
+        )
+
+        self.worker.finished_response.connect(self.on_response)
+        self.worker.error_response.connect(self.on_error)
+        self.worker.start()
+
+    def on_response(self, response):
+
+        self.chat.append(f"<b>VINI_JR:</b> {response}")
+
+        self.messages.append({
+            "role": "assistant",
+            "content": response
+        })
+
+        self.send.setEnabled(True)
+
+    def on_error(self, error):
+
+        self.chat.append(
+            f"<b>Erro na API:</b> {error}"
+        )
+
+        if self.messages and self.messages[-1]["role"] == "user":
+            self.messages.pop()
+
+        self.send.setEnabled(True)

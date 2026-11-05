@@ -1,0 +1,770 @@
+from pathlib import Path
+import hashlib
+import json
+import re
+import shutil
+from autonomy.backup_manager import BackupManager
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QListWidget, QListWidgetItem,
+    QSplitter, QPlainTextEdit, QTextEdit, QMessageBox,
+    QDialog, QDialogButtonBox
+)
+
+from PySide6.QtCore import Qt, QRect, QSize, QThread, Signal
+from PySide6.QtGui import (
+    QColor, QPainter, QTextFormat, QTextCursor
+)
+
+from project_engine.project_context import build_project_context
+from providers.openai_provider import OpenAIProvider
+
+
+class FixProposalWorker(QThread):
+    completed = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, api_key, model, finding, source_text):
+        super().__init__()
+        self.api_key = api_key
+        self.model = model
+        self.finding = finding
+        self.source_text = source_text
+
+    def run(self):
+        try:
+            provider = OpenAIProvider(self.api_key)
+            prompt = {
+                "diagnostico": self.finding,
+                "arquivo_completo": self.source_text,
+                "instrucoes": [
+                    "Analise o diagnostico e o arquivo.",
+                    "Proponha uma unica correcao localizada.",
+                    "Nao reescreva o arquivo inteiro.",
+                    "original_snippet deve ser copiado literalmente do codigo.",
+                    "replacement_snippet deve conter a substituicao completa.",
+                    "Nao use reticencias nem omita linhas.",
+                    "Se nao houver correcao segura, applicable=false.",
+                    "Responda somente JSON valido, sem Markdown.",
+                    "Campos: applicable (boolean), original_snippet (string), "
+                    "replacement_snippet (string), explanation (string).",
+                ],
+            }
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Voce e um engenheiro de firmware C/C++. "
+                        "Proponha alteracoes minimas e justificadas. "
+                        "Nunca invente trechos do arquivo."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(prompt, ensure_ascii=False),
+                },
+            ]
+            response = provider.send_message(messages, self.model).strip()
+            response = re.sub(
+                r"^```(?:json)?\s*|\s*```$",
+                "",
+                response,
+                flags=re.IGNORECASE,
+            ).strip()
+            result = json.loads(response)
+            if not isinstance(result, dict):
+                raise ValueError("A resposta da IA nao e um objeto JSON.")
+            if not isinstance(result.get("applicable"), bool):
+                raise ValueError("Campo applicable ausente ou invalido.")
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+
+class LineNumberArea(QWidget):
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+
+    def sizeHint(self):
+        return QSize(self.editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self.editor.paint_line_number_area(event)
+
+
+class CodeEditor(QPlainTextEdit):
+
+    def __init__(self):
+        super().__init__()
+
+        self.line_number_area = LineNumberArea(self)
+
+        self.setReadOnly(True)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+        self.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #111827;
+                color: #E5E7EB;
+                border: none;
+                font-family: Consolas;
+                font-size: 12px;
+            }
+        """)
+
+        self.blockCountChanged.connect(
+            self.update_line_number_area_width
+        )
+
+        self.updateRequest.connect(
+            self.update_line_number_area
+        )
+
+        self.update_line_number_area_width(0)
+
+    def line_number_area_width(self):
+
+        digits = len(str(max(1, self.blockCount())))
+
+        return 15 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def update_line_number_area_width(self, _):
+
+        self.setViewportMargins(
+            self.line_number_area_width(), 0, 0, 0
+        )
+
+    def update_line_number_area(self, rect, dy):
+
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(
+                0,
+                rect.y(),
+                self.line_number_area.width(),
+                rect.height()
+            )
+
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event):
+
+        super().resizeEvent(event)
+
+        contents = self.contentsRect()
+
+        self.line_number_area.setGeometry(
+            QRect(
+                contents.left(),
+                contents.top(),
+                self.line_number_area_width(),
+                contents.height()
+            )
+        )
+
+    def paint_line_number_area(self, event):
+
+        painter = QPainter(self.line_number_area)
+
+        painter.fillRect(
+            event.rect(),
+            QColor("#1F2937")
+        )
+
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+
+        top = int(
+            self.blockBoundingGeometry(block)
+            .translated(self.contentOffset())
+            .top()
+        )
+
+        bottom = top + int(
+            self.blockBoundingRect(block).height()
+        )
+
+        while block.isValid() and top <= event.rect().bottom():
+
+            if block.isVisible() and bottom >= event.rect().top():
+
+                painter.setPen(QColor("#94A3B8"))
+
+                painter.drawText(
+                    0,
+                    top,
+                    self.line_number_area.width() - 8,
+                    self.fontMetrics().height(),
+                    Qt.AlignmentFlag.AlignRight,
+                    str(block_number + 1)
+                )
+
+            block = block.next()
+            top = bottom
+
+            bottom = top + int(
+                self.blockBoundingRect(block).height()
+            )
+
+            block_number += 1
+
+    def highlight_line(self, line_number):
+
+        if line_number < 1:
+            return
+
+        block = self.document().findBlockByNumber(
+            line_number - 1
+        )
+
+        if not block.isValid():
+            return
+
+        cursor = QTextCursor(block)
+
+        self.setTextCursor(cursor)
+        self.centerCursor()
+
+        selection = QTextEdit.ExtraSelection()
+
+        selection.format.setBackground(
+            QColor("#57451D")
+        )
+
+        selection.format.setProperty(
+            QTextFormat.Property.FullWidthSelection,
+            True
+        )
+
+        selection.cursor = cursor
+
+        self.setExtraSelections([selection])
+
+
+class CodeReviewPanel(QWidget):
+
+    def __init__(self):
+        super().__init__()
+
+        self.project_path_provider = None
+        self.current_project = None
+        self.findings = []
+        self.current_finding = None
+        self.current_file_path = None
+        self.original_file_text = None
+        self.original_file_hash = None
+        self.pending_proposal = None
+        self.fix_worker = None
+
+        layout = QVBoxLayout(self)
+
+        header = QHBoxLayout()
+
+        title = QLabel("VINI_JR - CODE REVIEW")
+        title.setStyleSheet(
+            "font-size: 18px; font-weight: bold;"
+        )
+
+        self.analyze_button = QPushButton("Analisar projeto")
+        self.analyze_button.clicked.connect(
+            self.analyze_project
+        )
+
+        self.status = QLabel(
+            "Selecione um projeto e execute a analise."
+        )
+
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.analyze_button)
+
+        layout.addLayout(header)
+        layout.addWidget(self.status)
+
+        splitter = QSplitter(
+            Qt.Orientation.Horizontal
+        )
+
+        # Painel esquerdo: diagnosticos
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+
+        left_layout.addWidget(
+            QLabel("DIAGNOSTICOS ENCONTRADOS")
+        )
+
+        self.findings_list = QListWidget()
+
+        self.findings_list.currentItemChanged.connect(
+            self.open_finding
+        )
+
+        left_layout.addWidget(self.findings_list)
+
+        # Painel direito: codigo-fonte
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+
+        self.file_label = QLabel(
+            "Nenhum arquivo selecionado"
+        )
+
+        self.file_label.setStyleSheet(
+            "font-weight: bold; color: #60A5FA;"
+        )
+
+        self.editor = CodeEditor()
+
+        self.detail_label = QLabel(
+            "Selecione um diagnostico para visualizar o codigo."
+        )
+
+        self.detail_label.setWordWrap(True)
+
+        self.propose_button = QPushButton("Propor correcao com IA")
+        self.propose_button.setEnabled(False)
+        self.propose_button.clicked.connect(self.propose_fix)
+
+        right_layout.addWidget(self.file_label)
+        right_layout.addWidget(self.editor, 1)
+        right_layout.addWidget(self.detail_label)
+        right_layout.addWidget(self.propose_button)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+
+        splitter.setSizes([350, 900])
+
+        layout.addWidget(splitter, 1)
+
+    def set_project_path_provider(self, provider):
+
+        self.project_path_provider = provider
+
+    def analyze_project(self):
+
+        if not self.project_path_provider:
+
+            QMessageBox.warning(
+                self,
+                "Projeto",
+                "Caminho do projeto nao configurado."
+            )
+
+            return
+
+        project = self.project_path_provider()
+
+        if not project:
+
+            QMessageBox.warning(
+                self,
+                "Projeto",
+                "Selecione um projeto na aba Embedded Development."
+            )
+
+            return
+
+        self.analyze_button.setEnabled(False)
+        self.status.setText("Analisando projeto...")
+
+        try:
+
+            context = build_project_context(project)
+
+            self.current_project = Path(project).resolve()
+
+            static = context.get("static_analysis", {})
+
+            self.findings = static.get("findings", [])
+
+            self.findings_list.clear()
+
+            for index, finding in enumerate(self.findings):
+
+                severity = finding.get(
+                    "severity", "info"
+                ).upper()
+
+                rule = finding.get(
+                    "rule", "UNKNOWN"
+                )
+
+                filename = finding.get(
+                    "file", "arquivo desconhecido"
+                )
+
+                line = finding.get(
+                    "line", 0
+                )
+
+                title = finding.get(
+                    "title", "Diagnostico"
+                )
+
+                item = QListWidgetItem(
+                    f"[{severity}] {rule}\n"
+                    f"{filename}:{line}\n"
+                    f"{title}"
+                )
+
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    index
+                )
+
+                if severity == "ERROR":
+                    item.setForeground(QColor("#F87171"))
+
+                elif severity == "WARNING":
+                    item.setForeground(QColor("#FBBF24"))
+
+                else:
+                    item.setForeground(QColor("#93C5FD"))
+
+                self.findings_list.addItem(item)
+
+            counts = static.get("counts", {})
+
+            self.status.setText(
+                f"Projeto: {self.current_project} | "
+                f"Arquivos: {static.get('files_analyzed', 0)} | "
+                f"Achados: {len(self.findings)} | "
+                f"Erros: {counts.get('error', 0)} | "
+                f"Warnings: {counts.get('warning', 0)}"
+            )
+
+            if self.findings:
+
+                self.findings_list.setCurrentRow(0)
+
+            else:
+
+                self.editor.clear()
+
+                self.file_label.setText(
+                    "Nenhum diagnostico"
+                )
+
+                self.detail_label.setText(
+                    "Nenhum achado foi identificado pelas regras atuais."
+                )
+
+        except Exception as error:
+
+            QMessageBox.critical(
+                self,
+                "Erro na analise",
+                str(error)
+            )
+
+            self.status.setText(
+                "Falha ao analisar projeto."
+            )
+
+        finally:
+
+            self.analyze_button.setEnabled(True)
+
+    def propose_fix(self):
+        if not self.current_finding or not self.current_file_path:
+            QMessageBox.warning(self, "Correcao", "Selecione um diagnostico primeiro.")
+            return
+        if self.fix_worker and self.fix_worker.isRunning():
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Enviar codigo para OpenAI",
+            "O diagnostico e o conteudo do arquivo selecionado serao enviados "
+            "a OpenAI para gerar uma proposta.\n\n"
+            "Verifique se o codigo nao contem senhas, tokens, chaves "
+            "ou informacoes confidenciais. Deseja continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            project_root = Path(self.current_project).resolve()
+            target = self.current_file_path.resolve()
+            target.relative_to(project_root)
+
+            current_bytes = target.read_bytes()
+            current_hash = hashlib.sha256(current_bytes).hexdigest()
+            if current_hash != self.original_file_hash:
+                raise RuntimeError(
+                    "O arquivo foi alterado desde a analise. Execute novamente a analise."
+                )
+
+            try:
+                current_text = current_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                current_text = current_bytes.decode("latin-1")
+
+            config = json.loads(
+                Path("config/providers.json").read_text(encoding="utf-8-sig")
+            )
+            settings = json.loads(
+                Path("config/settings.json").read_text(encoding="utf-8-sig")
+            )
+            api_key = config.get("openai", {}).get("api_key", "")
+            model = settings.get("model", "gpt-4.1-mini")
+            if not api_key:
+                raise ValueError("Configure a API Key da OpenAI.")
+
+            self.proposal_target = target
+            self.proposal_root = project_root
+            self.proposal_source = current_text
+            self.proposal_hash = current_hash
+            self.proposal_bytes = current_bytes
+
+            self.propose_button.setEnabled(False)
+            self.status.setText("Solicitando proposta a OpenAI...")
+            self.fix_worker = FixProposalWorker(
+                api_key, model, dict(self.current_finding), current_text
+            )
+            self.fix_worker.completed.connect(self.on_fix_proposed)
+            self.fix_worker.failed.connect(self.on_fix_error)
+            self.fix_worker.start()
+        except Exception as exc:
+            self.propose_button.setEnabled(True)
+            QMessageBox.critical(self, "Erro", str(exc))
+
+    def on_fix_error(self, error):
+        self.propose_button.setEnabled(True)
+        self.status.setText("Falha ao gerar proposta.")
+        QMessageBox.critical(self, "Erro na proposta de correcao", error)
+
+    def on_fix_proposed(self, proposal):
+        self.propose_button.setEnabled(True)
+        if not proposal.get("applicable", False):
+            QMessageBox.information(
+                self,
+                "Sem correcao segura",
+                str(
+                    proposal.get(
+                        "explanation",
+                        "A IA nao encontrou uma substituicao segura.",
+                    )
+                ),
+            )
+            return
+
+        original = proposal.get("original_snippet")
+        replacement = proposal.get("replacement_snippet")
+        explanation = proposal.get("explanation", "")
+        if not isinstance(original, str) or not isinstance(replacement, str):
+            QMessageBox.warning(
+                self, "Proposta invalida", "A IA nao retornou os trechos como texto."
+            )
+            return
+        if not original or not replacement or original == replacement:
+            QMessageBox.warning(
+                self, "Proposta invalida", "Os trechos estao vazios ou sao identicos."
+            )
+            return
+        if self.proposal_source.count(original) != 1:
+            QMessageBox.warning(
+                self,
+                "Proposta ambigua",
+                "O trecho original nao aparece exatamente uma vez. A aplicacao foi bloqueada.",
+            )
+            return
+
+        self.pending_proposal = {
+            "original": original,
+            "replacement": replacement,
+            "explanation": str(explanation),
+            "file_hash": self.proposal_hash,
+            "target": self.proposal_target,
+            "root": self.proposal_root,
+        }
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Comparacao da proposta de correcao")
+        dialog.resize(1100, 650)
+        layout = QVBoxLayout(dialog)
+        explanation_label = QLabel(str(explanation))
+        explanation_label.setWordWrap(True)
+        layout.addWidget(explanation_label)
+
+        comparison = QSplitter(Qt.Orientation.Horizontal)
+        original_panel = QWidget()
+        original_layout = QVBoxLayout(original_panel)
+        original_layout.addWidget(QLabel("TRECHO ORIGINAL"))
+        original_editor = QPlainTextEdit()
+        original_editor.setReadOnly(True)
+        original_editor.setPlainText(original)
+        original_layout.addWidget(original_editor)
+
+        replacement_panel = QWidget()
+        replacement_layout = QVBoxLayout(replacement_panel)
+        replacement_layout.addWidget(QLabel("TRECHO SUGERIDO"))
+        replacement_editor = QPlainTextEdit()
+        replacement_editor.setReadOnly(True)
+        replacement_editor.setPlainText(replacement)
+        replacement_layout.addWidget(replacement_editor)
+
+        comparison.addWidget(original_panel)
+        comparison.addWidget(replacement_panel)
+        layout.addWidget(comparison, 1)
+
+        buttons = QDialogButtonBox()
+        apply_button = buttons.addButton(
+            "Aprovar e aplicar", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        reject_button = buttons.addButton(
+            "Rejeitar", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        apply_button.clicked.connect(dialog.accept)
+        reject_button.clicked.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.apply_fix()
+        else:
+            self.pending_proposal = None
+            self.status.setText("Proposta rejeitada.")
+
+    def apply_fix(self):
+        proposal = self.pending_proposal
+        if not proposal:
+            return
+        try:
+            target = Path(proposal["target"]).resolve()
+            root = Path(proposal["root"]).resolve()
+            target.relative_to(root)
+
+            current_bytes = target.read_bytes()
+            if hashlib.sha256(current_bytes).hexdigest() != proposal["file_hash"]:
+                raise RuntimeError(
+                    "O arquivo mudou desde a proposta. A aplicacao foi bloqueada."
+                )
+
+            try:
+                current_text = current_bytes.decode("utf-8-sig")
+                has_bom = current_bytes.startswith(b"\xef\xbb\xbf")
+                output_encoding = "utf-8"
+            except UnicodeDecodeError:
+                current_text = current_bytes.decode("latin-1")
+                has_bom = False
+                output_encoding = "latin-1"
+
+            original = proposal["original"]
+            replacement = proposal["replacement"]
+            if current_text.count(original) != 1:
+                raise RuntimeError(
+                    "O trecho original nao esta presente exatamente uma vez."
+                )
+
+            updated_text = current_text.replace(original, replacement, 1)
+            backup = BackupManager.create_backup(target)
+
+            output_bytes = updated_text.encode(output_encoding)
+            if has_bom:
+                output_bytes = b"\xef\xbb\xbf" + output_bytes
+
+            temp = target.with_name(target.name + ".vini_jr.tmp")
+            try:
+                temp.write_bytes(output_bytes)
+                temp.replace(target)
+            finally:
+                if temp.exists():
+                    temp.unlink()
+
+            self.pending_proposal = None
+            QMessageBox.information(
+                self,
+                "Correcao aplicada",
+                "A alteracao foi aplicada.\n"
+                f"Backup criado em:\n{backup}\n\n"
+                "Execute novamente a analise e a compilacao para validar.",
+            )
+            self.analyze_project()
+        except Exception as exc:
+            QMessageBox.critical(self, "Alteracao bloqueada", str(exc))
+
+    def open_finding(self, current, previous=None):
+
+
+        if current is None or self.current_project is None:
+            return
+
+        index = current.data(
+            Qt.ItemDataRole.UserRole
+        )
+
+        if index is None:
+            return
+
+        finding = self.findings[index]
+        self.current_finding = finding
+        self.pending_proposal = None
+
+        relative_path = finding.get("file", "")
+        line_number = int(finding.get("line", 1))
+
+        try:
+
+            root = self.current_project.resolve()
+
+            target = (root / relative_path).resolve()
+
+            # Bloqueia caminhos fora da raiz do projeto.
+
+            try:
+                target.relative_to(root)
+            except ValueError:
+                raise ValueError(
+                    "O arquivo solicitado esta fora da pasta do projeto."
+                )
+
+            if not target.is_file():
+                raise FileNotFoundError(
+                    f"Arquivo nao encontrado: {target}"
+                )
+
+            try:
+                source = target.read_text(
+                    encoding="utf-8"
+                )
+            except UnicodeDecodeError:
+                source = target.read_text(
+                    encoding="latin-1"
+                )
+
+            self.current_file_path = target
+            self.original_file_text = source
+            self.original_file_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+            self.propose_button.setEnabled(True)
+            self.editor.setPlainText(source)
+
+            self.editor.highlight_line(line_number)
+
+            self.file_label.setText(
+                f"{relative_path} — Linha {line_number}"
+            )
+
+            self.detail_label.setText(
+                f"Regra: {finding.get('rule', '')} | "
+                f"Severidade: {finding.get('severity', '')}\n"
+                f"Evidencia: {finding.get('evidence', '')}\n"
+                f"Recomendacao: {finding.get('recommendation', '')}"
+            )
+
+        except Exception as error:
+
+            QMessageBox.warning(
+                self,
+                "Erro ao abrir arquivo",
+                str(error)
+            )

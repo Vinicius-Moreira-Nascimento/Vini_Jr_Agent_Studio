@@ -1,0 +1,62 @@
+from collections import Counter
+
+from project_engine.project_scanner import scan_project
+from project_engine.project_reader import read_project_sources
+from project_engine.firmware_analyzer import analyze_firmware
+from project_engine.c_static_analyzer import analyze_sources
+
+
+def build_project_context(root):
+    inventory = scan_project(root, max_files=200)
+
+    contents = read_project_sources(
+        root,
+        max_files=200,
+        max_total_chars=60000
+    )
+
+    analysis = analyze_firmware(contents)
+    static_analysis = analyze_sources(contents)
+
+    extensions = Counter(
+        item["extension"] or "[sem extensao]"
+        for item in inventory
+    )
+
+    return {
+        "project_path": str(root),
+        "total_files_found": len(inventory),
+        "files_read": len(contents),
+        "extensions": dict(extensions),
+        "inventory": inventory,
+        "analysis": analysis,
+        "static_analysis": static_analysis,
+        "source_files": contents
+    }
+
+
+def format_project_context(context):
+    import json
+
+    metadata = {
+        "project_path": context["project_path"],
+        "total_files_found": context["total_files_found"],
+        "files_read": context["files_read"],
+        "extensions": context["extensions"],
+        "analysis": context["analysis"],
+        "static_analysis": context["static_analysis"],
+        "inventory": context["inventory"]
+    }
+
+    sections = [
+        "CONTEXTO DO PROJETO EMBARCADO",
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        "\nCODIGO-FONTE DOS ARQUIVOS:"
+    ]
+
+    for filename, content in context["source_files"].items():
+        sections.append(
+            f"\n--- ARQUIVO: {filename} ---\n{content}"
+        )
+
+    return "\n".join(sections)

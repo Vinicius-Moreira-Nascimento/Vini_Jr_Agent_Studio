@@ -1,0 +1,34 @@
+from pathlib import Path
+import os
+import shutil
+
+
+class BackupManager:
+    """Cria backups sequenciais sem sobrescrever arquivos anteriores."""
+
+    @staticmethod
+    def create_backup(source_path):
+        source = Path(source_path).resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"Arquivo para backup nao encontrado: {source}")
+
+        index = 1
+        while True:
+            backup = source.with_name(f"{source.name}.{index}_bak")
+            try:
+                descriptor = os.open(
+                    str(backup), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666
+                )
+            except FileExistsError:
+                index += 1
+                continue
+
+            try:
+                with os.fdopen(descriptor, "wb") as output:
+                    with source.open("rb") as original_file:
+                        shutil.copyfileobj(original_file, output)
+                shutil.copystat(source, backup)
+            except Exception:
+                backup.unlink(missing_ok=True)
+                raise
+            return backup

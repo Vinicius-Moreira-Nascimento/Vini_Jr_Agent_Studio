@@ -1,0 +1,238 @@
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import unittest
+
+from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtWidgets import QApplication
+
+from autonomy.correction_workflow import CorrectionWorkflow
+from interface.correction_panel import CorrectionPanel
+
+
+class FakeCorrectionEngine:
+
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = 0
+
+    def analyze_and_plan(self, objective):
+        self.calls += 1
+
+        if self.error:
+            raise self.error
+
+        return {
+            "task_id": "panel-test-task",
+            "status": "completed",
+            "analysis": {},
+            "planning_input": {"inventory": []},
+            "plan": {
+                "summary": "Resumo de teste do firmware.",
+                "findings": [
+                    {
+                        "id": "F001",
+                        "severity": "high",
+                        "title": "Problema de teste",
+                        "file": "main.c",
+                        "line": 10,
+                    }
+                ],
+                "actions": [
+                    {
+                        "id": "A001",
+                        "priority": "high",
+                        "title": "Revisar inicialização",
+                        "description": "Verificar sequência de inicialização.",
+                    }
+                ],
+                "risks": [
+                    "Possível impacto na inicialização do firmware."
+                ],
+            },
+        }
+
+
+class CorrectionPanelTests(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance()
+
+        if cls.app is None:
+            cls.app = QApplication([])
+
+    def wait_for_signal(self, signal, timeout=5000):
+        loop = QEventLoop()
+        received = []
+
+        def on_signal(*args):
+            received.append(args)
+            loop.quit()
+
+        signal.connect(on_signal)
+        QTimer.singleShot(timeout, loop.quit)
+
+        loop.exec()
+        signal.disconnect(on_signal)
+
+        self.assertTrue(
+            received,
+            "O sinal esperado não foi recebido dentro do prazo.",
+        )
+
+        return received[0]
+
+    def test_panel_displays_successful_plan(self):
+        engine = FakeCorrectionEngine()
+        workflow = CorrectionWorkflow(engine)
+        panel = CorrectionPanel(workflow)
+
+        self.wait_for_signal(
+            workflow.plan_ready,
+            trigger=None,
+        ) if False else None
+
+        received = []
+
+        workflow.plan_ready.connect(
+            lambda result: received.append(result)
+        )
+
+        panel.start_button.click()
+
+        loop = QEventLoop()
+
+        def finish():
+            if received:
+                loop.quit()
+
+        workflow.plan_ready.connect(
+            lambda _result: finish()
+        )
+
+        QTimer.singleShot(5000, loop.quit)
+        loop.exec()
+
+        self.assertEqual(engine.calls, 1)
+        self.assertEqual(len(received), 1)
+
+        self.assertIn(
+            "Resumo de teste",
+            panel.summary.toPlainText(),
+        )
+
+        self.assertEqual(
+            panel._list_widget(panel.findings_list).count(),
+            1,
+        )
+
+        self.assertEqual(
+            panel._list_widget(panel.actions_list).count(),
+            1,
+        )
+
+        self.assertEqual(
+            panel._list_widget(panel.risks_list).count(),
+            1,
+        )
+
+        self.assertFalse(panel.start_button.isEnabled())
+
+    def test_empty_objective_does_not_start_analysis(self):
+        engine = FakeCorrectionEngine()
+        workflow = CorrectionWorkflow(engine)
+        panel = CorrectionPanel(workflow)
+
+        panel.objective_input.setText("")
+        panel.start_analysis()
+
+        self.assertEqual(engine.calls, 0)
+        self.assertIn("objetivo", panel.status_label.text().lower())
+
+    def test_analysis_error_is_displayed(self):
+        engine = FakeCorrectionEngine(
+            error=RuntimeError("Falha simulada")
+        )
+
+        workflow = CorrectionWorkflow(engine)
+        panel = CorrectionPanel(workflow)
+
+        received = []
+
+        workflow.failed.connect(
+            lambda message: received.append(message)
+        )
+
+        panel.start_button.click()
+
+        loop = QEventLoop()
+
+        def finish():
+            if received:
+                loop.quit()
+
+        workflow.failed.connect(
+            lambda _message: finish()
+        )
+
+        QTimer.singleShot(5000, loop.quit)
+        loop.exec()
+
+        self.assertEqual(engine.calls, 1)
+        self.assertTrue(received)
+        self.assertIn("Falha simulada", panel.status_label.text())
+        self.assertTrue(panel.start_button.isEnabled())
+
+
+    def test_workflow_factory_is_lazy_and_used(self):
+        engine = FakeCorrectionEngine()
+        workflow = CorrectionWorkflow(engine)
+        factory_calls = []
+
+        def factory():
+            factory_calls.append(True)
+            return workflow
+
+        panel = CorrectionPanel(workflow_factory=factory)
+
+        self.assertEqual(factory_calls, [])
+        self.assertIsNone(panel.workflow)
+
+        received = []
+        loop = QEventLoop()
+
+        def on_ready(result):
+            received.append(result)
+            loop.quit()
+
+        workflow.plan_ready.connect(on_ready)
+
+        panel.start_button.click()
+
+        QTimer.singleShot(5000, loop.quit)
+        loop.exec()
+
+        self.assertEqual(factory_calls, [True])
+        self.assertIs(panel.workflow, workflow)
+        self.assertEqual(engine.calls, 1)
+        self.assertEqual(len(received), 1)
+
+    def test_workflow_factory_error_is_displayed(self):
+        def failing_factory():
+            raise RuntimeError("Projeto não selecionado")
+
+        panel = CorrectionPanel(workflow_factory=failing_factory)
+
+        panel.start_analysis()
+
+        self.assertIsNone(panel.workflow)
+        self.assertTrue(panel.start_button.isEnabled())
+        self.assertIn(
+            "Projeto não selecionado",
+            panel.status_label.text(),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,191 @@
+from enum import Enum
+from threading import RLock
+
+from PySide6.QtCore import QObject, QThread, Signal
+
+
+class CorrectionWorkflowState(str, Enum):
+    IDLE = "idle"
+    ANALYZING = "analyzing"
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPLYING = "applying"
+    BUILDING = "building"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class _AnalysisWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, correction_engine, objective):
+        super().__init__()
+        self.correction_engine = correction_engine
+        self.objective = objective
+
+    def run(self):
+        try:
+            result = self.correction_engine.analyze_and_plan(
+                objective=self.objective
+            )
+            self.succeeded.emit(result)
+        except Exception as error:
+            self.failed.emit(
+                f"{type(error).__name__}: {error}"
+            )
+
+
+class CorrectionWorkflow(QObject):
+    """
+    Coordenador assíncrono inicial do fluxo de correção.
+
+    Nesta versão, executa somente análise e planejamento.
+    Não aplica alterações, não executa Build, Full Clean ou Flash.
+    """
+
+    state_changed = Signal(str)
+    analysis_started = Signal(str)
+    plan_ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, correction_engine, parent=None):
+        super().__init__(parent)
+
+        if not callable(
+            getattr(correction_engine, "analyze_and_plan", None)
+        ):
+            raise TypeError(
+                "correction_engine precisa implementar analyze_and_plan()."
+            )
+
+        self.correction_engine = correction_engine
+        self._lock = RLock()
+        self._state = CorrectionWorkflowState.IDLE
+        self._worker = None
+        self._last_result = None
+
+    @property
+    def state(self):
+        with self._lock:
+            return self._state
+
+    @property
+    def last_result(self):
+        with self._lock:
+            return self._last_result
+
+    @property
+    def is_running(self):
+        with self._lock:
+            return self._state == CorrectionWorkflowState.ANALYZING
+
+    def _set_state(self, state):
+        with self._lock:
+            self._state = state
+
+        self.state_changed.emit(state.value)
+
+    def start_analysis(
+        self,
+        objective="Analisar e planejar melhorias no firmware",
+    ):
+        if not isinstance(objective, str) or not objective.strip():
+            raise ValueError("O objetivo precisa ser um texto válido.")
+
+        objective = objective.strip()
+
+        with self._lock:
+            if self._state not in (
+                CorrectionWorkflowState.IDLE,
+                CorrectionWorkflowState.FAILED,
+                CorrectionWorkflowState.COMPLETED,
+                CorrectionWorkflowState.CANCELLED,
+            ):
+                raise RuntimeError(
+                    "O workflow já possui uma operação em andamento "
+                    "ou aguarda aprovação."
+                )
+
+            if self._worker is not None and self._worker.isRunning():
+                raise RuntimeError(
+                    "A thread de análise anterior ainda está em execução."
+                )
+
+            self._state = CorrectionWorkflowState.ANALYZING
+            self._last_result = None
+
+        self.state_changed.emit(
+            CorrectionWorkflowState.ANALYZING.value
+        )
+
+        worker = _AnalysisWorker(
+            correction_engine=self.correction_engine,
+            objective=objective,
+        )
+
+        self._worker = worker
+
+        worker.succeeded.connect(self._on_analysis_succeeded)
+        worker.failed.connect(self._on_analysis_failed)
+        worker.finished.connect(self._on_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+
+        self.analysis_started.emit(objective)
+        worker.start()
+
+    def _on_analysis_succeeded(self, result):
+        with self._lock:
+            if self._state != CorrectionWorkflowState.ANALYZING:
+                return
+
+            self._last_result = result
+            self._state = CorrectionWorkflowState.AWAITING_APPROVAL
+
+        self.state_changed.emit(
+            CorrectionWorkflowState.AWAITING_APPROVAL.value
+        )
+        self.plan_ready.emit(result)
+
+    def _on_analysis_failed(self, message):
+        with self._lock:
+            self._last_result = None
+            self._state = CorrectionWorkflowState.FAILED
+
+        self.state_changed.emit(
+            CorrectionWorkflowState.FAILED.value
+        )
+        self.failed.emit(message)
+
+    def _on_worker_finished(self):
+        with self._lock:
+            self._worker = None
+
+    def reset(self):
+        """
+        Reinicia o coordenador após uma operação terminal.
+
+        Não descarta um plano que esteja aguardando aprovação.
+        """
+        with self._lock:
+            if self._state == CorrectionWorkflowState.AWAITING_APPROVAL:
+                raise RuntimeError(
+                    "Existe um plano aguardando aprovação."
+                )
+
+            if self._state == CorrectionWorkflowState.ANALYZING:
+                raise RuntimeError(
+                    "Não é possível reiniciar durante a análise."
+                )
+
+            if self._worker is not None and self._worker.isRunning():
+                raise RuntimeError(
+                    "A thread anterior ainda está em execução."
+                )
+
+            self._last_result = None
+            self._state = CorrectionWorkflowState.IDLE
+
+        self.state_changed.emit(
+            CorrectionWorkflowState.IDLE.value
+        )

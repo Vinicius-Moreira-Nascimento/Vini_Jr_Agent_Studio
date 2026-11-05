@@ -1,0 +1,218 @@
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import threading
+import unittest
+
+from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtWidgets import QApplication
+
+from autonomy.correction_workflow import (
+    CorrectionWorkflow,
+    CorrectionWorkflowState,
+)
+
+
+class FakeCorrectionEngine:
+
+    def __init__(self, result=None, error=None):
+        self.result = result or {
+            "task_id": "test-task",
+            "status": "completed",
+            "analysis": {"files_analyzed": 1},
+            "planning_input": {"inventory": []},
+            "plan": {
+                "summary": "Plano simulado",
+                "findings": [],
+                "actions": [],
+                "risks": [],
+            },
+        }
+        self.error = error
+        self.calls = 0
+
+    def analyze_and_plan(self, objective):
+        self.calls += 1
+
+        if self.error:
+            raise self.error
+
+        return self.result
+
+
+class BlockingCorrectionEngine:
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def analyze_and_plan(self, objective):
+        self.entered.set()
+
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("Timeout no teste.")
+
+        return {
+            "task_id": "blocking-task",
+            "status": "completed",
+            "analysis": {},
+            "planning_input": {"inventory": []},
+            "plan": {
+                "summary": "Plano simulado",
+                "findings": [],
+                "actions": [],
+                "risks": [],
+            },
+        }
+
+
+class CorrectionWorkflowTests(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance()
+
+        if cls.app is None:
+            cls.app = QApplication([])
+
+    def wait_for_signal(self, signal, timeout=5000, trigger=None):
+        loop = QEventLoop()
+        received = []
+
+        def on_signal(*args):
+            received.append(args)
+            loop.quit()
+
+        signal.connect(on_signal)
+        QTimer.singleShot(timeout, loop.quit)
+
+        if trigger is not None:
+            trigger()
+
+        loop.exec()
+        signal.disconnect(on_signal)
+
+        self.assertTrue(
+            received,
+            "O sinal esperado não foi recebido dentro do prazo.",
+        )
+
+        return received[0]
+
+    def test_initial_state_is_idle(self):
+        workflow = CorrectionWorkflow(FakeCorrectionEngine())
+
+        self.assertEqual(
+            workflow.state,
+            CorrectionWorkflowState.IDLE,
+        )
+        self.assertFalse(workflow.is_running)
+        self.assertIsNone(workflow.last_result)
+
+    def test_successful_analysis_waits_for_approval(self):
+        engine = FakeCorrectionEngine()
+        workflow = CorrectionWorkflow(engine)
+
+        result_holder = []
+
+        workflow.plan_ready.connect(
+            lambda result: result_holder.append(result)
+        )
+
+        workflow.start_analysis("Analisar firmware")
+
+        self.wait_for_signal(workflow.plan_ready)
+
+        self.assertEqual(
+            workflow.state,
+            CorrectionWorkflowState.AWAITING_APPROVAL,
+        )
+        self.assertEqual(engine.calls, 1)
+        self.assertIsNotNone(workflow.last_result)
+        self.assertEqual(len(result_holder), 1)
+
+    def test_analysis_failure_changes_state(self):
+        engine = FakeCorrectionEngine(
+            error=RuntimeError("Falha simulada")
+        )
+        workflow = CorrectionWorkflow(engine)
+
+        self.wait_for_signal(
+            workflow.failed,
+            trigger=lambda: workflow.start_analysis("Corrigir falha simulada"),
+        )
+
+        self.assertEqual(
+            workflow.state,
+            CorrectionWorkflowState.FAILED,
+        )
+        self.assertIsNone(workflow.last_result)
+
+    def test_empty_objective_is_rejected(self):
+        engine = FakeCorrectionEngine()
+        workflow = CorrectionWorkflow(engine)
+
+        with self.assertRaises(ValueError):
+            workflow.start_analysis("   ")
+
+        self.assertEqual(engine.calls, 0)
+        self.assertEqual(
+            workflow.state,
+            CorrectionWorkflowState.IDLE,
+        )
+
+    def test_concurrent_analysis_is_blocked(self):
+        engine = BlockingCorrectionEngine()
+        workflow = CorrectionWorkflow(engine)
+
+        workflow.start_analysis("Primeira análise")
+
+        try:
+            self.assertTrue(engine.entered.wait(timeout=3))
+
+            with self.assertRaises(RuntimeError):
+                workflow.start_analysis("Segunda análise")
+
+        finally:
+            engine.release.set()
+
+        self.wait_for_signal(workflow.plan_ready)
+
+        self.assertEqual(
+            workflow.state,
+            CorrectionWorkflowState.AWAITING_APPROVAL,
+        )
+
+    def test_reset_cannot_discard_pending_plan(self):
+        workflow = CorrectionWorkflow(FakeCorrectionEngine())
+
+        workflow._state = CorrectionWorkflowState.AWAITING_APPROVAL
+
+        with self.assertRaises(RuntimeError):
+            workflow.reset()
+
+        self.assertEqual(
+            workflow.state,
+            CorrectionWorkflowState.AWAITING_APPROVAL,
+        )
+
+    def test_failed_workflow_can_be_reset(self):
+        workflow = CorrectionWorkflow(
+            FakeCorrectionEngine(error=RuntimeError("Erro"))
+        )
+
+        self.wait_for_signal(
+            workflow.failed,
+            trigger=lambda: workflow.start_analysis("Corrigir falha simulada"),
+        )
+        workflow.reset()
+
+        self.assertEqual(
+            workflow.state,
+            CorrectionWorkflowState.IDLE,
+        )
+        self.assertIsNone(workflow.last_result)
+
+
+if __name__ == "__main__":
+    unittest.main()

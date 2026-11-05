@@ -1,0 +1,318 @@
+from PySide6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QListWidget,
+    QGroupBox,
+    QSplitter,
+    QPlainTextEdit,
+)
+from PySide6.QtCore import Qt
+
+
+class CorrectionPanel(QWidget):
+    """
+    Interface inicial do fluxo inteligente de correção.
+
+    Exibe análise e planejamento.
+    Não aprova nem aplica alterações e não executa Build, Full Clean ou Flash.
+    """
+
+    AVAILABLE_STATES = {
+        "idle": "Aguardando análise",
+        "analyzing": "Analisando projeto e elaborando plano...",
+        "awaiting_approval": "Plano recebido. Aguardando etapa de aprovação.",
+        "applying": "Aplicação não habilitada nesta interface.",
+        "building": "Build não habilitado nesta interface.",
+        "completed": "Processo concluído.",
+        "failed": "Falha durante o processo.",
+        "cancelled": "Processo cancelado.",
+    }
+
+    def __init__(self, workflow, parent=None):
+        super().__init__(parent)
+
+        required_signals = (
+            "state_changed",
+            "analysis_started",
+            "plan_ready",
+            "failed",
+        )
+
+        for signal_name in required_signals:
+            if not hasattr(workflow, signal_name):
+                raise TypeError(
+                    f"Workflow não possui o sinal obrigatório: {signal_name}"
+                )
+
+        if not callable(getattr(workflow, "start_analysis", None)):
+            raise TypeError(
+                "Workflow precisa implementar start_analysis()."
+            )
+
+        self.workflow = workflow
+        self._build_ui()
+
+        self.workflow.state_changed.connect(self._on_state_changed)
+        self.workflow.analysis_started.connect(self._on_analysis_started)
+        self.workflow.plan_ready.connect(self._on_plan_ready)
+        self.workflow.failed.connect(self._on_failed)
+
+        current_state = getattr(workflow, "state", "idle")
+        self._on_state_changed(
+            getattr(current_state, "value", current_state)
+        )
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        header = QHBoxLayout()
+
+        title = QLabel("VINI_JR - CORREÇÃO INTELIGENTE")
+        title.setStyleSheet(
+            "font-size: 18px; font-weight: bold;"
+        )
+
+        header.addWidget(title)
+        header.addStretch()
+
+        layout.addLayout(header)
+
+        objective_label = QLabel("Objetivo da análise")
+
+        self.objective_input = QLineEdit()
+        self.objective_input.setObjectName("correctionObjective")
+        self.objective_input.setText(
+            "Analisar o firmware, identificar problemas "
+            "e elaborar um plano de correção."
+        )
+
+        self.start_button = QPushButton("Iniciar análise")
+        self.start_button.setObjectName("startCorrectionAnalysis")
+        self.start_button.clicked.connect(self.start_analysis)
+
+        objective_layout = QHBoxLayout()
+        objective_layout.addWidget(self.objective_input, 1)
+        objective_layout.addWidget(self.start_button)
+
+        layout.addWidget(objective_label)
+        layout.addLayout(objective_layout)
+
+        self.status_label = QLabel("Aguardando análise.")
+        self.status_label.setObjectName("correctionStatus")
+        self.status_label.setWordWrap(True)
+
+        layout.addWidget(self.status_label)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        summary_group = QGroupBox("RESUMO DO PLANO")
+        summary_layout = QVBoxLayout(summary_group)
+
+        self.summary = QPlainTextEdit()
+        self.summary.setObjectName("correctionSummary")
+        self.summary.setReadOnly(True)
+        self.summary.setPlaceholderText(
+            "O resumo do planejamento aparecerá aqui."
+        )
+
+        summary_layout.addWidget(self.summary)
+        splitter.addWidget(summary_group)
+
+        details_widget = QWidget()
+        details_layout = QHBoxLayout(details_widget)
+
+        self.findings_list = self._create_list(
+            "ACHADOS IDENTIFICADOS",
+            "correctionFindings",
+        )
+
+        self.actions_list = self._create_list(
+            "AÇÕES PLANEJADAS",
+            "correctionActions",
+        )
+
+        self.risks_list = self._create_list(
+            "RISCOS IDENTIFICADOS",
+            "correctionRisks",
+        )
+
+        details_layout.addWidget(self.findings_list)
+        details_layout.addWidget(self.actions_list)
+        details_layout.addWidget(self.risks_list)
+
+        splitter.addWidget(details_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+        layout.addWidget(splitter, 1)
+
+        self.notice_label = QLabel(
+            "Modo de análise: nenhuma alteração será aplicada ao firmware."
+        )
+        self.notice_label.setWordWrap(True)
+        self.notice_label.setStyleSheet(
+            "color: #FBBF24; font-weight: bold;"
+        )
+
+        layout.addWidget(self.notice_label)
+
+    @staticmethod
+    def _create_list(title, object_name):
+        group = QGroupBox(title)
+        group.setObjectName(object_name + "Group")
+
+        layout = QVBoxLayout(group)
+
+        widget = QListWidget()
+        widget.setObjectName(object_name)
+        widget.setWordWrap(True)
+
+        layout.addWidget(widget)
+        group.setMinimumWidth(180)
+
+        return group
+
+    def _list_widget(self, group):
+        return group.findChild(QListWidget)
+
+    @staticmethod
+    def _value(item, key, default=""):
+        if isinstance(item, dict):
+            return item.get(key, default)
+
+        return default
+
+    @staticmethod
+    def _format_item(item):
+        if isinstance(item, str):
+            return item
+
+        if isinstance(item, dict):
+            parts = []
+
+            for key in (
+                "severity",
+                "priority",
+                "title",
+                "description",
+                "file",
+                "line",
+                "recommendation",
+            ):
+                value = item.get(key)
+
+                if value not in (None, ""):
+                    parts.append(f"{key}: {value}")
+
+            if parts:
+                return "\n".join(parts)
+
+        return str(item)
+
+    def start_analysis(self):
+        objective = self.objective_input.text().strip()
+
+        if not objective:
+            self.status_label.setText(
+                "Informe um objetivo antes de iniciar."
+            )
+            return
+
+        try:
+            self.start_button.setEnabled(False)
+            self.status_label.setText("Preparando análise...")
+
+            self.workflow.start_analysis(objective=objective)
+
+        except Exception as error:
+            self.start_button.setEnabled(True)
+            self.status_label.setText(
+                f"Não foi possível iniciar a análise: {error}"
+            )
+
+    def _on_analysis_started(self, objective):
+        self.status_label.setText(
+            f"Análise iniciada: {objective}"
+        )
+
+    def _on_state_changed(self, state):
+        state_value = getattr(state, "value", state)
+        state_value = str(state_value)
+
+        message = self.AVAILABLE_STATES.get(
+            state_value,
+            f"Estado atual: {state_value}",
+        )
+
+        self.status_label.setText(message)
+
+        self.start_button.setEnabled(
+            state_value in {
+                "idle",
+                "failed",
+                "completed",
+                "cancelled",
+            }
+        )
+
+    def _on_failed(self, message):
+        self.status_label.setText(
+            f"Falha na análise: {message}"
+        )
+        self.start_button.setEnabled(True)
+
+    def _on_plan_ready(self, result):
+        plan = getattr(result, "plan", None)
+
+        if plan is None and isinstance(result, dict):
+            plan = result.get("plan")
+
+        if not isinstance(plan, dict):
+            self.status_label.setText(
+                "A análise terminou, mas o plano recebido é inválido."
+            )
+            return
+
+        self.summary.setPlainText(
+            str(plan.get("summary", "Resumo não informado."))
+        )
+
+        findings = plan.get("findings", [])
+        actions = plan.get("actions", [])
+        risks = plan.get("risks", [])
+
+        self._populate_list(self.findings_list, findings)
+        self._populate_list(self.actions_list, actions)
+        self._populate_list(self.risks_list, risks)
+
+        task_id = getattr(result, "task_id", None)
+
+        if task_id is None and isinstance(result, dict):
+            task_id = result.get("task_id")
+
+        self.status_label.setText(
+            "Plano recebido com sucesso. "
+            f"Achados: {len(findings)} | "
+            f"Ações: {len(actions)} | "
+            f"Riscos: {len(risks)} | "
+            f"Tarefa: {task_id or 'não informado'}"
+        )
+
+    def _populate_list(self, group, items):
+        widget = self._list_widget(group)
+        widget.clear()
+
+        if not isinstance(items, list):
+            widget.addItem("Formato de dados inválido.")
+            return
+
+        if not items:
+            widget.addItem("Nenhum item identificado.")
+            return
+
+        for item in items:
+            widget.addItem(self._format_item(item))

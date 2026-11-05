@@ -1,0 +1,255 @@
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QLabel, QPushButton,
+    QMessageBox, QTabWidget
+)
+from PySide6.QtCore import QThread, Signal
+from interface.chat_panel import ChatPanel
+from interface.autonomy_control import AutonomyControl
+from interface.api_settings import APISettingsDialog
+from embedded.embedded_panel import EmbeddedPanel
+from providers.openai_provider import OpenAIProvider
+import json
+
+
+class ConnectionWorker(QThread):
+
+    result = Signal(str, bool)
+
+    def __init__(self, api_key, model):
+        super().__init__()
+        self.api_key = api_key
+        self.model = model
+
+    def run(self):
+        try:
+            provider = OpenAIProvider(self.api_key)
+            response = provider.test_connection(self.model)
+            self.result.emit(response, True)
+
+        except Exception as error:
+            self.result.emit(str(error), False)
+
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("VINI_JR Agent Studio")
+        self.resize(1350, 850)
+
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #18212F;
+                color: #E8EDF5;
+                font-size: 13px;
+            }
+
+            QPushButton {
+                background-color: #2563EB;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 9px 14px;
+            }
+
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+
+            QLineEdit, QTextEdit, QComboBox {
+                background-color: #263449;
+                color: white;
+                border: 1px solid #40516B;
+                border-radius: 5px;
+                padding: 7px;
+            }
+
+            QLabel {
+                color: #E8EDF5;
+            }
+
+            QTabWidget::pane {
+                border: 1px solid #40516B;
+                border-radius: 5px;
+            }
+
+            QTabBar::tab {
+                background-color: #263449;
+                color: #E8EDF5;
+                padding: 10px 20px;
+                margin-right: 3px;
+            }
+
+            QTabBar::tab:selected {
+                background-color: #2563EB;
+            }
+        """)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QVBoxLayout(central)
+
+        header = QHBoxLayout()
+
+        title = QLabel("VINI_JR AGENT STUDIO")
+        title.setStyleSheet(
+            "font-size: 22px; font-weight: bold;"
+        )
+
+        self.connection = QLabel("● Não conectado")
+        self.connection.setStyleSheet("color: #F59E0B;")
+
+        self.config_button = QPushButton("Configurar API")
+        self.config_button.clicked.connect(self.open_settings)
+
+        self.test_button = QPushButton("Testar conexão")
+        self.test_button.clicked.connect(self.test_connection)
+
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.connection)
+        header.addWidget(self.test_button)
+        header.addWidget(self.config_button)
+
+        main_layout.addLayout(header)
+
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs, 1)
+
+        chat_page = QWidget()
+        chat_layout = QVBoxLayout(chat_page)
+
+        self.chat = ChatPanel()
+        chat_layout.addWidget(self.chat, 1)
+
+        self.autonomy = AutonomyControl()
+        chat_layout.addWidget(self.autonomy)
+
+        self.autonomy.mode_changed.connect(
+            self.save_autonomy_mode
+        )
+
+        self.tabs.addTab(chat_page, "VINI_JR Agent")
+
+        self.embedded = EmbeddedPanel()
+        self.chat.set_project_path_provider(
+            lambda: self.embedded.project_path.text().strip()
+        )
+        self.chat.set_project_path_provider(
+            lambda: self.embedded.project_path.text().strip()
+        )
+        self.tabs.addTab(
+            self.embedded,
+            "Embedded Development"
+        )
+
+        self.load_autonomy_mode()
+
+        self.worker = None
+
+    def open_settings(self):
+
+        dialog = APISettingsDialog(self)
+        dialog.exec()
+
+    def test_connection(self):
+
+        with open(
+            "config/providers.json",
+            "r",
+            encoding="utf-8-sig"
+        ) as file:
+            config = json.load(file)
+
+        with open(
+            "config/settings.json",
+            "r",
+            encoding="utf-8-sig"
+        ) as file:
+            settings = json.load(file)
+
+        api_key = config["openai"].get("api_key", "")
+
+        if not api_key:
+            QMessageBox.warning(
+                self,
+                "VINI_JR",
+                "Configure sua API Key primeiro."
+            )
+            return
+
+        self.connection.setText("● Testando...")
+        self.test_button.setEnabled(False)
+
+        self.worker = ConnectionWorker(
+            api_key,
+            settings.get("model", "gpt-4.1-mini")
+        )
+
+        self.worker.result.connect(self.on_connection_result)
+        self.worker.start()
+
+    def on_connection_result(self, result, success):
+
+        self.test_button.setEnabled(True)
+
+        if success:
+            self.connection.setText("● Conectado")
+            self.connection.setStyleSheet("color: #22C55E;")
+
+            QMessageBox.information(
+                self,
+                "VINI_JR",
+                result
+            )
+        else:
+            self.connection.setText("● Falha na conexão")
+            self.connection.setStyleSheet("color: #EF4444;")
+
+            QMessageBox.critical(
+                self,
+                "Erro de conexão",
+                result
+            )
+
+    def load_autonomy_mode(self):
+
+        with open(
+            "config/settings.json",
+            "r",
+            encoding="utf-8-sig"
+        ) as file:
+            settings = json.load(file)
+
+        mode = settings.get("autonomy_mode", "manual")
+        index = self.autonomy.mode.findData(mode)
+
+        if index >= 0:
+            self.autonomy.mode.setCurrentIndex(index)
+
+    def save_autonomy_mode(self, mode):
+
+        path = "config/settings.json"
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8-sig"
+        ) as file:
+            settings = json.load(file)
+
+        settings["autonomy_mode"] = mode
+
+        with open(
+            path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(settings, file, indent=4)
+
+        self.statusBar().showMessage(
+            f"Modo de autonomia: {mode}"
+        )

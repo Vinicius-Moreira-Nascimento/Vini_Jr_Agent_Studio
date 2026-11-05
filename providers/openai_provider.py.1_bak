@@ -1,0 +1,25 @@
+﻿from openai import OpenAI
+from providers.base_provider import BaseProvider
+
+class OpenAIProvider(BaseProvider):
+
+    def __init__(self, api_key):
+        self.client = OpenAI(api_key=api_key)
+
+    def send_message(self, messages, model):
+
+        response = self.client.responses.create(
+            model=model,
+            input=messages
+        )
+
+        return response.output_text
+
+    def test_connection(self, model):
+
+        response = self.client.responses.create(
+            model=model,
+            input="Responda apenas: CONEXAO VINI_JR OK"
+        )
+
+        return response.output_text
